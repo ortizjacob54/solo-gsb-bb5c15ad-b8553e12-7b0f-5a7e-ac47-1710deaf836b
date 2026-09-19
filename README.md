@@ -4,12 +4,15 @@
 **带数量与可旋转标记**的矩形零件，输出只由**贯穿当前余料区域的直切**
 （guillotine cut）组成、可直接上机执行的切割方案：每件零件落在第几号母板、
 坐标、朝向，以及按顺序编号的切割线和最终余料矩形。已保存的方案可一键导出为
-确定性的机床 G-code（G0/G1 直切、板间 M0 换板）。
+确定性的机床 G-code（G0/G1 直切、板间 M0 换板），并可启动**持久化的切割执行
+会话**：车间按 `(panel_no, step)` 刀序逐刀回报“完成当前刀”，服务端在 SQLite
+事务内校验版本与刀序，幂等键重试安全返回原结果。
 
 - 语言/框架：Python 3.12 · FastAPI · Pydantic v2
 - 数据库：SQLite（单文件，WAL 模式，启动自动建库）
 - 保证：零件不重叠、不越界；锯缝实际占位；同输入稳定（确定性算法 + 幂等存储）；
-  排不下的零件以明确原因列出；G-code 导出前逐刀几何校验，异常方案整体拒绝。
+  排不下的零件以明确原因列出；G-code 导出前逐刀几何校验，异常方案整体拒绝；
+  切割会话的版本校验、刀序校验与状态推进在单个事务内完成，并发安全。
 
 ---
 
@@ -270,6 +273,88 @@ M2
 `region_outside_board` / `non_sequential_steps` / `invalid_axis` /
 `invalid_length` / `invalid_region` / `invalid_cut`。
 
+### `POST /api/v1/plans/{plan_id}/sessions` — 启动切割执行会话
+
+从**已保存**的方案启动一个持久化的切割执行会话（`201`）。会话把方案的全部
+切割线按 `(panel_no, step)` 展平成全局刀序（与 G-code 导出同序），车间按
+刀序逐刀回报完成。方案不存在返回 `404`。
+
+- 方案没有任何切割线时（如零件恰好铺满母板），会话**创建即 `completed`**。
+- 同一方案可启动多个会话（例如同一方案多次下料），各自独立推进。
+
+响应（`CutSession`，与查询接口同构）：
+
+```jsonc
+{
+  "session_id": "f3c2a1…",
+  "plan_id": "a6df23c6-…",
+  "status": "active",            // active / completed
+  "completed": false,            // 等价于 status == "completed"
+  "version": 0,                  // 乐观并发版本：每完成一刀 +1
+  "current_panel": 1,            // 当前母板 panel_no；已完成为 null
+  "next_cut": {                  // 下一刀；已完成为 null
+    "panel_no": 1, "step": 1, "axis": "V",
+    "x": 120.0, "y": 0.0, "length": 122.0,
+    "region": {"x": 0.0, "y": 0.0, "width": 244.0, "height": 122.0}
+  },
+  "completed_cuts": 0,           // 已完成刀数
+  "total_cuts": 7,               // 方案总刀数
+  "created_at": "2026-09-19T17:41:42Z",
+  "updated_at": "2026-09-19T17:41:42Z",
+  "completed_at": null
+}
+```
+
+### `GET /api/v1/sessions/{session_id}` — 查询切割会话
+
+返回当前母板、下一刀、已完成数与 `completed` 状态（结构同上）；
+不存在返回 `404`。
+
+```bash
+curl -s http://localhost:8000/api/v1/sessions/f3c2a1-…
+```
+
+### `POST /api/v1/sessions/{session_id}/events` — 提交“完成当前刀”事件
+
+按 `(panel_no, step)` 刀序逐刀回报。请求体：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `panel_no` | integer, ≥1 | 所完成刀所在的母板编号 |
+| `step` | integer, ≥1 | 所完成刀在该母板上的 step |
+| `expected_version` | integer, ≥0 | 提交时观测到的会话版本（乐观并发令牌） |
+| `idempotency_key` | string, 1–128 字符 | 幂等键 |
+
+服务端在**单个 SQLite 事务（`BEGIN IMMEDIATE`）**内依次校验：幂等键未受理过
+→ 会话未完成 → `expected_version` 等于当前版本 → `(panel_no, step)` 正是
+当前应执行的刀；全部通过才推进状态（版本 +1、已完成数 +1，最后一刀后会话
+`completed`），并把本次响应快照以 `(session_id, idempotency_key)` 落库后
+一并提交。
+
+- **幂等重试**：同一 `idempotency_key` 再次提交，直接返回首次受理时的响应
+  （`200`，内容相同），状态不再推进——网络重试、双击、重发都安全。
+- **并发安全**：`BEGIN IMMEDIATE` 使并发提交在数据库层串行化；旧版本
+  （`expected_version` 过期）或跳步/错刀请求一律 `409`，**不会推进状态**。
+- 只有被受理的事件才占用幂等键；被拒（`409`）的请求不落库，修正参数后可
+  复用同一键重发。
+
+`409` 错误体（`detail` 为结构化 JSON）：
+
+| `detail.error` | 含义 |
+|---|---|
+| `version_conflict` | 版本过期；`detail.current_version` 为当前版本 |
+| `cut_mismatch` | 跳步/错刀；`detail.expected` / `detail.got` 指明应为与实收刀序 |
+| `session_completed` | 会话已完成，不再接受新事件 |
+
+示例（推进一刀）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/sessions/f3c2a1-…/events \
+  -H 'Content-Type: application/json' \
+  -d '{"panel_no": 1, "step": 1, "expected_version": 0,
+       "idempotency_key": "panel1-cut1"}'
+```
+
 ### `GET /health`
 
 返回 `{"status":"ok"}`，供容器健康检查与负载均衡探活。
@@ -313,14 +398,14 @@ M2
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由（创建/查询/列表/G-code 导出/健康检查）+ 启动建库
+│   ├── main.py          # FastAPI 路由（方案/ G-code / 切割会话 / 健康检查）+ 启动建库
 │   ├── models.py        # 请求/响应 Pydantic 模型与参数校验
 │   ├── nesting.py       # 直切排样核心算法 + 几何自检 + 响应装配
 │   ├── gcode.py         # G-code 导出：坐标变换、导出前校验、确定性文本生成
-│   ├── services.py      # 业务编排、幂等落库
-│   ├── database.py      # SQLite 连接、建表、plan_id 摘要、CRUD
+│   ├── services.py      # 业务编排、幂等落库、切割会话事务（版本/刀序校验与推进）
+│   ├── database.py      # SQLite 连接、建表（plans / cut_sessions / cut_events）、CRUD
 │   └── init_db.py       # python -m app.init_db 建库入口
-├── tests/               # unittest：核心算法/随机不变量/持久化幂等/G-code/API 端到端
+├── tests/               # unittest：核心算法/随机不变量/持久化幂等/G-code/会话并发与重试/API 端到端
 ├── entrypoint.sh        # 容器启动：建库 + uvicorn（一条命令）
 ├── Dockerfile
 ├── docker-compose.yml
@@ -337,4 +422,5 @@ python3 -m unittest discover -s tests -v
 测试覆盖：恰好放满、锯缝切分、旋转启用/禁用、母板上限、超大件、编号连续、
 零锯缝铺满、**300 组随机算例的贯穿切模拟与面积/重叠/数量不变量**、
 结果稳定性（含输入乱序）、SQLite 幂等存取、**G-code 坐标变换/确定性/行号映射/
-总长/导出前校验**，以及基于 TestClient 的 HTTP 端到端。
+总长/导出前校验**、**切割会话的幂等重试/版本与刀序冲突/多线程并发推进/
+无切割线即完成**，以及基于 TestClient 的 HTTP 端到端。

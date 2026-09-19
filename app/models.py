@@ -143,3 +143,40 @@ class GcodeResponse(BaseModel):
 
 class HealthOut(BaseModel):
     status: str
+
+
+class NextCutOut(BaseModel):
+    panel_no: int = Field(..., description="下一刀所在母板编号")
+    step: int = Field(..., description="下一刀在该母板上的 step")
+    axis: Literal["V", "H"]
+    x: float
+    y: float
+    length: float
+    region: RectOut
+
+
+class CutSessionOut(BaseModel):
+    session_id: str
+    plan_id: str
+    status: Literal["active", "completed"]
+    completed: bool = Field(..., description="是否已全部切完（等价于 status==completed）")
+    version: int = Field(..., description="乐观并发版本：每完成一刀 +1；提交事件时以 expected_version 回传")
+    current_panel: int | None = Field(..., description="当前母板 panel_no；已完成为 null")
+    next_cut: NextCutOut | None = Field(..., description="下一刀；已完成为 null")
+    completed_cuts: int = Field(..., description="已完成刀数")
+    total_cuts: int = Field(..., description="方案总刀数")
+    created_at: str
+    updated_at: str
+    completed_at: str | None
+
+
+class CutEventRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    panel_no: int = Field(..., ge=1, description="所完成刀所在的母板编号")
+    step: int = Field(..., ge=1, description="所完成刀在该母板上的 step")
+    expected_version: int = Field(
+        ..., ge=0, description="提交时观测到的会话版本（乐观并发令牌）")
+    idempotency_key: str = Field(
+        ..., min_length=1, max_length=128,
+        description="幂等键：同一键重试返回首次受理时的结果，状态不重复推进")
