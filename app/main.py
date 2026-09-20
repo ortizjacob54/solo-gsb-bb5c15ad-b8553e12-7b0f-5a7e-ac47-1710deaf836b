@@ -2,10 +2,13 @@
 
 启动即初始化 SQLite（见 lifespan）；接口：
   GET  /health
-  POST /api/v1/plans                  创建/获取排样方案（幂等）
-  GET  /api/v1/plans/{plan_id}        查询单个方案
-  GET  /api/v1/plans                  查询方案列表（分页）
-  POST /api/v1/plans/{plan_id}/gcode  导出方案的 G-code
+  POST /api/v1/plans                          创建/获取排样方案（幂等）
+  GET  /api/v1/plans/{plan_id}                查询单个方案
+  GET  /api/v1/plans                          查询方案列表（分页）
+  POST /api/v1/plans/{plan_id}/gcode          导出方案的 G-code
+  POST /api/v1/plans/{plan_id}/sessions       从方案启动切割执行会话
+  GET  /api/v1/sessions/{session_id}          查询切割会话状态
+  POST /api/v1/sessions/{session_id}/events   提交“完成当前刀”事件（幂等）
 """
 from __future__ import annotations
 
@@ -16,6 +19,7 @@ from fastapi.responses import JSONResponse
 
 from . import database as db
 from .models import (
+    CutEventRequest,
     GcodeRequest,
     GcodeResponse,
     HealthOut,
@@ -23,8 +27,17 @@ from .models import (
     PlanRequest,
     PlanResponse,
     PlanSummary,
+    SessionResponse,
 )
-from .services import PlanGeometryError, create_plan, export_gcode
+from .services import (
+    PlanGeometryError,
+    SessionConflictError,
+    create_plan,
+    export_gcode,
+    get_session_state,
+    start_session,
+    submit_cut_event,
+)
 
 
 @asynccontextmanager
@@ -40,8 +53,11 @@ app = FastAPI(
         "面向小型加工坊的矩形零件母板直切（guillotine）排样服务。"
         "仅生成贯穿当前余料区域的直切方案，锯缝占位，"
         "相同输入返回稳定且幂等的结果。"
+        "支持从已保存方案启动持久化的切割执行会话：按 panel_no/step 顺序"
+        "逐刀汇报进度，乐观锁版本 + 幂等键在 SQLite 事务中校验，"
+        "并发与重试不会破坏执行状态。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -117,3 +133,47 @@ def list_plans(
         total=total,
         plans=[PlanSummary(**row) for row in rows],
     )
+
+
+@app.post(
+    "/api/v1/plans/{plan_id}/sessions",
+    response_model=SessionResponse,
+    status_code=201,
+    tags=["sessions"],
+    summary="从已保存方案启动切割执行会话",
+)
+def post_plan_session(plan_id: str) -> SessionResponse:
+    payload = start_session(plan_id)
+    if payload is None:
+        raise HTTPException(status_code=404, detail="方案不存在")
+    return JSONResponse(payload, status_code=201)
+
+
+@app.get(
+    "/api/v1/sessions/{session_id}",
+    response_model=SessionResponse,
+    tags=["sessions"],
+    summary="查询切割会话状态",
+)
+def get_session(session_id: str) -> SessionResponse:
+    payload = get_session_state(session_id)
+    if payload is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return JSONResponse(payload)
+
+
+@app.post(
+    "/api/v1/sessions/{session_id}/events",
+    response_model=SessionResponse,
+    tags=["sessions"],
+    summary="提交“完成当前刀”事件（版本 + 幂等键，事务校验）",
+)
+def post_session_event(session_id: str, req: CutEventRequest) -> SessionResponse:
+    try:
+        payload = submit_cut_event(session_id, req)
+    except SessionConflictError as exc:
+        # 版本/当前刀/幂等键冲突或会话已完成：状态未推进
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
+    if payload is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return JSONResponse(payload)

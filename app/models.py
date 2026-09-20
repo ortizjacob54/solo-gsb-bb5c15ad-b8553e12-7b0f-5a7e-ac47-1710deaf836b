@@ -1,7 +1,7 @@
 """请求与响应 Pydantic 模型（Pydantic v2）。"""
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator, ConfigDict
 
@@ -143,3 +143,48 @@ class GcodeResponse(BaseModel):
 
 class HealthOut(BaseModel):
     status: str
+
+
+# ---------------------------------------------------------------------------
+# 切割执行会话
+# ---------------------------------------------------------------------------
+
+class CutEventRequest(BaseModel):
+    """“完成当前刀”事件：版本与当前刀由服务端在事务中一并校验。"""
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: int = Field(
+        ..., ge=0, description="客户端看到的会话版本（乐观锁）")
+    idempotency_key: str = Field(
+        ..., min_length=1, max_length=128,
+        description="幂等键（会话内唯一）：同键重试返回首次结果")
+    panel_no: int = Field(..., ge=1, description="刚完成的刀所在母板编号")
+    step: int = Field(..., ge=1, description="刚完成的刀在该母板上的序号")
+
+
+class SessionCutOut(BaseModel):
+    """会话视角的一刀（在方案 CutOut 之上附带母板编号）。"""
+    panel_no: int
+    step: int
+    axis: Literal["V", "H"]
+    x: float
+    y: float
+    length: float
+    region: RectOut
+
+
+class SessionResponse(BaseModel):
+    session_id: str
+    plan_id: str
+    status: Literal["active", "completed"]
+    completed: bool = Field(..., description="全部切割是否已完成")
+    version: int = Field(..., description="当前版本号，每完成一刀 +1")
+    completed_cuts: int = Field(..., description="已完成刀数")
+    total_cuts: int = Field(..., description="总刀数（启动会话时快照）")
+    current_panel: Optional[int] = Field(
+        ..., description="当前母板编号（下一刀所在板）；已完成为 null")
+    next_cut: Optional[SessionCutOut] = Field(
+        ..., description="下一刀；已完成为 null")
+    created_at: str
+    updated_at: str
+    completed_at: Optional[str]

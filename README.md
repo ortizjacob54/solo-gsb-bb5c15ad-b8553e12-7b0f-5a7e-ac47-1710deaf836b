@@ -9,7 +9,9 @@
 - 语言/框架：Python 3.12 · FastAPI · Pydantic v2
 - 数据库：SQLite（单文件，WAL 模式，启动自动建库）
 - 保证：零件不重叠、不越界；锯缝实际占位；同输入稳定（确定性算法 + 幂等存储）；
-  排不下的零件以明确原因列出；G-code 导出前逐刀几何校验，异常方案整体拒绝。
+  排不下的零件以明确原因列出；G-code 导出前逐刀几何校验，异常方案整体拒绝；
+  切割执行会话持久化，逐刀事件以乐观锁版本 + 幂等键在 SQLite 事务中校验，
+  并发与重试不会破坏执行状态。
 
 ---
 
@@ -270,6 +272,95 @@ M2
 `region_outside_board` / `non_sequential_steps` / `invalid_axis` /
 `invalid_length` / `invalid_region` / `invalid_cut`。
 
+### `POST /api/v1/plans/{plan_id}/sessions` — 启动切割执行会话
+
+从**已保存**的方案启动一个持久化的切割执行会话（`201`；方案不存在 `404`）。
+会话把方案的全部切割线按 `(panel_no, step)` 展平为全局执行序列（与 G-code
+导出同序），由客户端逐刀汇报推进。同一方案可启动多个会话（例如多次下料），
+各自独立推进、互不影响。
+
+**无切割线的方案**（零件恰好铺满母板、或全部零件未排入）启动即完成：
+`status="completed"`、`completed=true`、`completed_at` 即刻写入。
+
+响应（`201`，与查询/事件接口同构的 `SessionResponse`）：
+
+```jsonc
+{
+  "session_id": "3f8c…",
+  "plan_id": "a6df…",
+  "status": "active",            // active / completed
+  "completed": false,            // 全部刀是否已完成
+  "version": 0,                  // 乐观锁版本，每完成一刀 +1
+  "completed_cuts": 0,           // 已完成刀数
+  "total_cuts": 20,              // 总刀数（启动时快照）
+  "current_panel": 1,            // 当前母板（下一刀所在板）；已完成为 null
+  "next_cut": {                  // 下一刀；已完成为 null
+    "panel_no": 1, "step": 1, "axis": "V",
+    "x": 120.0, "y": 0.0, "length": 122.0,
+    "region": {"x": 0.0, "y": 0.0, "width": 244.0, "height": 122.0}
+  },
+  "created_at": "2026-09-19T17:41:42Z",
+  "updated_at": "2026-09-19T17:41:42Z",
+  "completed_at": null
+}
+```
+
+### `GET /api/v1/sessions/{session_id}` — 查询切割会话
+
+返回当前母板、下一刀、已完成数与 `completed` 状态（结构同上）；
+不存在返回 `404`。
+
+```bash
+curl -s http://localhost:8000/api/v1/sessions/3f8c…
+```
+
+### `POST /api/v1/sessions/{session_id}/events` — 提交“完成当前刀”事件
+
+按 `panel_no/step` 顺序逐刀汇报“当前刀已切完”。请求体：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `expected_version` | int, ≥0 | 客户端看到的会话版本（乐观锁） |
+| `idempotency_key` | string, 1~128 字符 | 幂等键（会话内唯一） |
+| `panel_no` | int, ≥1 | 刚完成的刀所在母板编号 |
+| `step` | int, ≥1 | 刚完成的刀在该母板上的序号 |
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/sessions/3f8c…/events \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_version": 0, "idempotency_key": "p1-s1", "panel_no": 1, "step": 1}'
+```
+
+服务端在**单个 SQLite 写事务（`BEGIN IMMEDIATE`）**内依次执行：查幂等记录 →
+校验会话未完成 → 校验 `expected_version` 等于当前版本 → 校验所报
+`(panel_no, step)` 正是当前刀 → 推进版本与进度并记录事件，然后一次性提交。
+由此保证：
+
+- **幂等重试**：同一 `idempotency_key` + 相同请求体重试，返回首次应用的
+  原始响应（HTTP `200`，逐字段一致），状态不重复推进；
+- **同键不同请求**：`409 idempotency_key_reuse`；
+- **并发/旧版本**：`expected_version` 与当前版本不一致 →
+  `409 version_conflict`，状态不推进。`BEGIN IMMEDIATE` 使并发写者在库级
+  串行，同版本并发请求只有一个能应用，其余读到推进后的版本并被拒绝；
+- **跳步/乱序**：所报刀不是当前刀 → `409 cut_mismatch`，状态不推进；
+- **已完成**：`409 session_completed`；会话不存在 `404`。
+
+成功返回推进后的会话状态（结构同 `SessionResponse`）。冲突响应示例：
+
+```jsonc
+{
+  "detail": {
+    "error": "version_conflict",
+    "message": "expected_version=3 与当前版本 5 不一致，状态未推进",
+    "expected_version": 3,
+    "current_version": 5
+  }
+}
+```
+
+`detail.error` 取值：`version_conflict` / `cut_mismatch` /
+`session_completed` / `idempotency_key_reuse`。
+
 ### `GET /health`
 
 返回 `{"status":"ok"}`，供容器健康检查与负载均衡探活。
@@ -313,14 +404,14 @@ M2
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由（创建/查询/列表/G-code 导出/健康检查）+ 启动建库
+│   ├── main.py          # FastAPI 路由（方案/会话/事件/G-code/健康检查）+ 启动建库
 │   ├── models.py        # 请求/响应 Pydantic 模型与参数校验
 │   ├── nesting.py       # 直切排样核心算法 + 几何自检 + 响应装配
 │   ├── gcode.py         # G-code 导出：坐标变换、导出前校验、确定性文本生成
-│   ├── services.py      # 业务编排、幂等落库
-│   ├── database.py      # SQLite 连接、建表、plan_id 摘要、CRUD
+│   ├── services.py      # 业务编排、幂等落库、切割会话推进（事务校验）
+│   ├── database.py      # SQLite 连接、建表、plan_id 摘要、方案/会话 CRUD、写事务
 │   └── init_db.py       # python -m app.init_db 建库入口
-├── tests/               # unittest：核心算法/随机不变量/持久化幂等/G-code/API 端到端
+├── tests/               # unittest：核心算法/随机不变量/持久化幂等/G-code/会话并发/API 端到端
 ├── entrypoint.sh        # 容器启动：建库 + uvicorn（一条命令）
 ├── Dockerfile
 ├── docker-compose.yml
@@ -337,4 +428,6 @@ python3 -m unittest discover -s tests -v
 测试覆盖：恰好放满、锯缝切分、旋转启用/禁用、母板上限、超大件、编号连续、
 零锯缝铺满、**300 组随机算例的贯穿切模拟与面积/重叠/数量不变量**、
 结果稳定性（含输入乱序）、SQLite 幂等存取、**G-code 坐标变换/确定性/行号映射/
-总长/导出前校验**，以及基于 TestClient 的 HTTP 端到端。
+总长/导出前校验**、**切割会话的启动/查询/逐刀推进/零切割即完成、幂等重试原样
+返回、同键冲突、旧版本与跳步拒绝、多线程并发竞争（同版本唯一胜者、同键全员
+重放、带重试跑完整个会话）**，以及基于 TestClient 的 HTTP 端到端。
